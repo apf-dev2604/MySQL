@@ -18,7 +18,7 @@ This repository covers tasks and scripts related to:
 - MySQL query review and optimization
 - MySQL schema and index review
 - MySQL data engineering work
-- ETL and ELT processes involving MySQL
+- ETL and ELT processes
 - Data extraction from MySQL to files, SFTP, object storage, or downstream systems
 - Operational reports and DBA task documentation
 

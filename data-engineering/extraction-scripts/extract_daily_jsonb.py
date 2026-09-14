@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Lindy-mode MySQL 8.0 large-table extractor for EGMS game transactions.
+MySQL 8.0 extractor 
 
 Purpose:
 - Extract large MySQL table safely using keyset pagination.

@@ -20,7 +20,7 @@ from psycopg2 import sql
 PG_HOST = "iest-db-postgresql.cvmg4ca8uhd2.ap-southeast-1.rds.amazonaws.com"
 PG_PORT = 5432
 PG_USER = "egms_loader"
-PG_PASSWORD = "334Gsx-#$_45452Kl0s"
+PG_PASSWORD = ""
 PG_DATABASE = "iestdl"
 
 # Source extract location from the MySQL extractor.

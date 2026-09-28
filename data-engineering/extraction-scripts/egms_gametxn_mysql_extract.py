@@ -10,9 +10,8 @@ Purpose:
 - Write PostgreSQL-ready JSONL.GZ output with shape: id, data, game_dt.
 - Treat source MariaDB/MySQL datetime values as UTC/system time and write UTC ISO milliseconds with Z.
 - Omit Idx and write data JSON keys in the approved PostgreSQL payload order.
-- Compute:
-    JACKPOT_PAYOUT       = JW1 + JW2 + JW3 + JW4 + JW5
-    JACKPOT_CONTRIBUTION = PC1 + PC2 + PC3 + PC4 + PC5
+- Do not compute derived jackpot fields in extraction.
+  Derived fields such as JACKPOT_PAYOUT and JACKPOT_CONTRIBUTION are handled later by the loader/target layer.
 - Validate source database count against generated JSONL row count before PASS.
 - Create a manifest with row count, checksum, start/end time, and duration.
 - Optional local or SFTP handoff.
@@ -91,7 +90,8 @@ SOURCE_TIMEZONE = timezone.utc
 
 # Local directories.
 BASE_DIR = Path("/home/allanf/scripts/artem")
-OUTPUT_DIR = BASE_DIR / "out"
+#OUTPUT_DIR = BASE_DIR / "out"
+OUTPUT_DIR = BASE_DIR / "extraction" / "mysql"
 WORK_DIR = BASE_DIR / "work"
 LOG_DIR = BASE_DIR / "logs"
 LOCK_FILE = BASE_DIR / "extract_egms_gamestx.lock"
@@ -130,7 +130,7 @@ APP_NAME = "extract_egms_gamestx_safe"
 
 # Source columns to SELECT from MariaDB/MySQL.
 # Idx is intentionally omitted from the extract payload.
-# Computed fields are added in Python and then ordered using PAYLOAD_COLUMNS.
+# No computed fields are added in extraction; loader/target layer handles derived fields later.
 SOURCE_SELECT_COLUMNS = [
     "JW1",
     "JW2",
@@ -178,10 +178,8 @@ PAYLOAD_COLUMNS = [
     "GameProvider",
     "PlayerAccount",
     "TransactionID",
-    "JACKPOT_PAYOUT",
     "SEED_MONEY_WON",
     "UpdateDateTime",
-    "JACKPOT_CONTRIBUTION",
     "PROGRESSIVE_CONTRIBUTION_PAID",
     "SEED_MONEY_JACKPOT_WON_OVER_1000",
 ]
@@ -417,17 +415,12 @@ def parse_args() -> Config:
     parser.add_argument("--db", default=DEFAULT_DB, help="MySQL/MariaDB database name.")
     parser.add_argument("--table", default=DEFAULT_TABLE, help="MySQL/MariaDB table name.")
     parser.add_argument("--pwd", required=True, help="MySQL/MariaDB password.")
-    parser.add_argument("--from", dest="window_from", required=True, help="UTC start datetime. Example: 2025-11-28 06:00:00
-")
+    parser.add_argument("--from", dest="window_from", required=True, help="UTC start datetime. Example: 2025-11-28 06:00:00")
     parser.add_argument("--to", dest="window_to", required=True, help="UTC end datetime. Example: 2025-11-29 06:00:00")
-    parser.add_argument("--date-column", default=DEFAULT_DATE_COLUMN, help="Date column filter. Usually GameDate or UpdateD
-ateTime.")
-    parser.add_argument("--dest", choices=["local", "sftp"], default=DEFAULT_DEST, help="Output destination: local or sftp.
-")
-    parser.add_argument("--fetch-size", type=int, default=FETCH_SIZE, help="Rows read from cursor at a time. Not total row
-limit.")
-    parser.add_argument("--max-rows", type=int, default=MAX_ROWS_TO_EXTRACT, help="Optional test cap. 0 means unlimited/ful
-l extract.")
+    parser.add_argument("--date-column", default=DEFAULT_DATE_COLUMN, help="Date column filter. Usually GameDate or UpdateDateTime.")
+    parser.add_argument("--dest", choices=["local", "sftp"], default=DEFAULT_DEST, help="Output destination: local or sftp.")
+    parser.add_argument("--fetch-size", type=int, default=FETCH_SIZE, help="Rows read from cursor at a time. Not total row limit.")
+    parser.add_argument("--max-rows", type=int, default=MAX_ROWS_TO_EXTRACT, help="Optional test cap. 0 means unlimited/full extract.")
 
     args = parser.parse_args()
 
@@ -595,10 +588,7 @@ def write_manifest(
         "duration_minutes": round(duration_seconds / 60.0, 3),
         "duration_hhmmss": duration_hhmmss(duration_seconds),
         "destination": cfg.dest,
-        "computed_fields": {
-            "JACKPOT_PAYOUT": "JW1 + JW2 + JW3 + JW4 + JW5",
-            "JACKPOT_CONTRIBUTION": "PC1 + PC2 + PC3 + PC4 + PC5",
-        },
+        "computed_fields": "not_computed_in_extraction; handled later by loader/target layer",
         "file": {
             "file_name": output_file.name,
             "size_bytes": output_file.stat().st_size,
@@ -725,7 +715,6 @@ def run_extract(cfg: Config) -> None:
 
                     for row in rows:
                         source_payload = {col: serialize_value(row.get(col)) for col in SOURCE_SELECT_COLUMNS}
-                        add_computed_fields(source_payload)
 
                         # Keep the JSONB payload keys in the exact approved order.
                         # Python 3.9 preserves dict insertion order.

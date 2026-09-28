@@ -7,6 +7,7 @@ import logging
 import sys
 import time
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Tuple, Dict, List
 
@@ -26,7 +27,8 @@ PG_DATABASE = "iestdl"
 # Source extract location from the MySQL extractor.
 # Expected file:
 #   /home/allanf/scripts/artem/out/egms_games_txn_yyyymmdd/egms_games_txn_yyyymmdd.jsonl.gz
-SOURCE_BASE_DIR = Path("/home/allanf/scripts/artem/out")
+#SOURCE_BASE_DIR = Path("/home/allanf/scripts/artem/out")
+SOURCE_BASE_DIR = Path("/home/allanf/scripts/artem/extraction/mysql")
 FILE_PREFIX = "egms_games_txn"
 
 # Final PostgreSQL destination is intentionally NOT defaulted.
@@ -72,9 +74,9 @@ def seconds_to_hhmmss(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def setup_logging(log_dir: Path) -> Path:
+def setup_logging(log_dir: Path, load_date: str = None) -> Path:
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / f"{APP_NAME}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_file = log_dir / f"{APP_NAME}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{load_date}.log"
 
     logging.basicConfig(
         level=logging.INFO,
@@ -125,6 +127,7 @@ def pg_connect(args):
         password=args.pg_password,
         dbname=args.pg_database,
         connect_timeout=15,
+        sslmode="require"
     )
 
 
@@ -547,13 +550,105 @@ def write_existing_in_final_skips(conn, args, output_file: Path) -> int:
 # =============================================================================
 
 def stable_json_text(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    """Serialize JSON without sorting keys so the approved payload sequence is retained."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def json_default(value: Any) -> str:
     if isinstance(value, datetime):
         return value.isoformat()
     return str(value)
+
+
+# Exact JSONB payload order retained from the original extractor output.
+# This keeps new loaded rows consistent with the existing PostgreSQL JSONB payload shape.
+PAYLOAD_COLUMNS = [
+    "JW1",
+    "JW2",
+    "JW3",
+    "JW4",
+    "JW5",
+    "PC1",
+    "PC2",
+    "PC3",
+    "PC4",
+    "PC5",
+    "Outlet",
+    "GameDate",
+    "GameName",
+    "SessionID",
+    "TotalWins",
+    "TotalStakes",
+    "GameProvider",
+    "PlayerAccount",
+    "TransactionID",
+    "JACKPOT_PAYOUT",
+    "SEED_MONEY_WON",
+    "UpdateDateTime",
+    "JACKPOT_CONTRIBUTION",
+    "PROGRESSIVE_CONTRIBUTION_PAID",
+    "SEED_MONEY_JACKPOT_WON_OVER_1000",
+]
+
+
+# =============================================================================
+# TRANSFORM STEP: JACKPOT DERIVED FIELDS
+# =============================================================================
+# Purpose:
+#   The extractor now extracts raw MariaDB/MySQL values only.
+#   This loader performs the small transformation needed to preserve the existing
+#   PostgreSQL JSONB payload format.
+#
+# Derived fields added here before COPY into the temp table:
+#   JACKPOT_PAYOUT       = JW1 + JW2 + JW3 + JW4 + JW5
+#   JACKPOT_CONTRIBUTION = PC1 + PC2 + PC3 + PC4 + PC5
+#
+# Keep this section easy to find if future transform rules are added.
+
+def to_decimal(value: Any) -> Decimal:
+    """Safely convert JSON numeric/string values to Decimal for jackpot calculations."""
+    if value is None:
+        return Decimal("0.000000")
+    if isinstance(value, Decimal):
+        return value
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return Decimal("0.000000")
+
+
+def decimal_6(value: Decimal) -> str:
+    return str(value.quantize(Decimal("0.000001")))
+
+
+def add_computed_fields_to_payload(payload: Dict[str, Any]) -> None:
+    """
+    Add the derived fields removed from the extraction step.
+
+    This keeps the extractor as extract-only while preserving the existing PostgreSQL
+    JSONB payload shape expected by the target table.
+    """
+    jackpot_payout = sum(to_decimal(payload.get(col)) for col in ["JW1", "JW2", "JW3", "JW4", "JW5"])
+    jackpot_contribution = sum(to_decimal(payload.get(col)) for col in ["PC1", "PC2", "PC3", "PC4", "PC5"])
+
+    payload["JACKPOT_PAYOUT"] = decimal_6(jackpot_payout)
+    payload["JACKPOT_CONTRIBUTION"] = decimal_6(jackpot_contribution)
+
+
+def transform_payload_for_postgres(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Transform the extractor payload into the existing PostgreSQL JSONB payload shape.
+
+    This function:
+      1. Keeps the original extracted key/value pairs.
+      2. Adds JACKPOT_PAYOUT and JACKPOT_CONTRIBUTION.
+      3. Rebuilds the payload using the old PAYLOAD_COLUMNS sequence.
+
+    No output JSON file is rewritten here. The transformation happens in memory while
+    streaming the source JSONL.GZ into PostgreSQL COPY.
+    """
+    add_computed_fields_to_payload(payload)
+    return {col: payload.get(col) for col in PAYLOAD_COLUMNS}
 
 
 def count_jsonl_rows(gz_file: Path) -> int:
@@ -605,6 +700,12 @@ def copy_jsonl_to_temp(conn, args, gz_file: Path) -> int:
                     obj = json.loads(line)
                     row_id = str(obj["id"])
                     data_obj = obj["data"]
+
+                    # TRANSFORM STEP:
+                    # Add derived jackpot fields and rebuild the JSON payload using
+                    # the old approved PAYLOAD_COLUMNS order before COPY to PostgreSQL.
+                    data_obj = transform_payload_for_postgres(data_obj)
+
                     game_dt = str(obj["game_dt"])
                     data_text = stable_json_text(data_obj)
                 except Exception as exc:
@@ -755,7 +856,7 @@ def copy_temp_to_history(conn, args) -> int:
 
 def main() -> int:
     args = parse_args()
-    log_file = setup_logging(LOG_DIR)
+    log_file = setup_logging(LOG_DIR, args.date)
 
     if args.file:
         gz_file = Path(args.file)
